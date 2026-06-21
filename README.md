@@ -164,7 +164,6 @@ lib/
 
 **TrueWorld Studio**
 - GitHub: [@seth0-0in](https://github.com/seth0-0in)
-- Email: ysj50830@daum.net
 
 ---
 
