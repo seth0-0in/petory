@@ -385,7 +385,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => HealthScreen(petId: _pet.id, initialTab: 0),
+            builder: (_) =>
+                HealthScreen(petId: _pet.id, initialTab: HealthTab.weight),
           ),
         );
         break;
@@ -394,7 +395,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => HealthScreen(petId: _pet.id, initialTab: 1),
+            builder: (_) => HealthScreen(
+              petId: _pet.id,
+              initialTab: HealthTab.vaccinations,
+            ),
           ),
         );
         break;
@@ -402,7 +406,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => HealthScreen(petId: _pet.id, initialTab: 3),
+            builder: (_) =>
+                HealthScreen(petId: _pet.id, initialTab: HealthTab.vetVisits),
           ),
         );
         break;

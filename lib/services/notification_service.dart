@@ -5,9 +5,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:timezone/data/latest_all.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 
+import '../models/cage_log.dart';
+import '../models/cage_schedule.dart';
+import '../models/grooming_record.dart';
+import '../models/heat_cycle.dart';
 import '../models/medication.dart';
 import '../models/pet.dart';
+import '../models/todo_item.dart';
 import '../models/vaccination.dart';
+import '../models/vet_visit.dart';
 
 class NotificationTap {
   final String petId;
@@ -25,8 +31,17 @@ class NotificationService {
   static const String _androidChannelName = '리마인더';
   static const String _androidChannelDesc = '예방접종, 기념일, 투약 등 리마인더 알림';
 
-  // 시퀀셜 ID(접종·기념일)는 0..0x3FFFFFFF, 투약 해시 ID는 0x40000000..0x7FFFFFFF.
+  // 시퀀셜 ID(접종·기념일·일회성)는 0..0x07FFFFFF,
+  // 할 일(todo) 해시 ID는 0x08000000..0x0FFFFFFF,
+  // 케이지(청소·먹이·물) 해시 ID는 0x10000000..0x1FFFFFFF,
+  // 정기 검진(시니어) 해시 ID는 0x20000000..0x3FFFFFFF,
+  // 투약 해시 ID는 0x40000000..0x7FFFFFFF.
   static const int _medicationIdMask = 0x40000000;
+  static const int _checkupIdMask = 0x20000000;
+  static const int _cageIdMask = 0x10000000;
+  static const int _todoIdMask = 0x08000000;
+
+  static const Duration _checkupOverdueAfter = Duration(days: 180);
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -167,6 +182,13 @@ class NotificationService {
     required List<Pet> pets,
     required Map<String, List<Vaccination>> vaccinationsByPetId,
     Map<String, List<Medication>> medicationsByPetId = const {},
+    Map<String, List<VetVisit>> vetVisitsByPetId = const {},
+    Map<String, List<GroomingRecord>> groomingRecordsByPetId = const {},
+    Map<String, List<HeatCycle>> heatCyclesByPetId = const {},
+    Map<String, List<CageSchedule>> cageSchedulesByPetId = const {},
+    Set<String> seniorPetIds = const {},
+    Set<String> healthLoggedTodayPetIds = const {},
+    List<TodoItem> todos = const [],
   }) async {
     if (kIsWeb) return;
     if (!_initialized) return;
@@ -179,6 +201,19 @@ class NotificationService {
     var nextId = 1;
 
     for (final pet in pets) {
+      if (seniorPetIds.contains(pet.id)) {
+        await _scheduleDailyHealthCheck(
+          id: nextId++,
+          pet: pet,
+          loggedToday: healthLoggedTodayPetIds.contains(pet.id),
+        );
+        await _scheduleCheckupReminderIfDue(
+          pet: pet,
+          vetVisits: vetVisitsByPetId[pet.id] ?? const <VetVisit>[],
+          today: today,
+        );
+      }
+
       final vaccinations = vaccinationsByPetId[pet.id] ?? const <Vaccination>[];
       for (final v in vaccinations) {
         final due = v.nextDueAt;
@@ -276,6 +311,202 @@ class NotificationService {
       for (final m in medications) {
         await _scheduleMedication(pet: pet, medication: m, today: today);
       }
+
+      final grooming =
+          groomingRecordsByPetId[pet.id] ?? const <GroomingRecord>[];
+      for (final g in grooming) {
+        final due = g.nextDueAt;
+        if (due == null) continue;
+        final dueDate = DateTime(due.year, due.month, due.day);
+        final dayBefore = dueDate.subtract(const Duration(days: 1));
+        final dayBeforeAt9 = DateTime(
+          dayBefore.year,
+          dayBefore.month,
+          dayBefore.day,
+          9,
+        );
+        if (dayBeforeAt9.isAfter(now)) {
+          await _scheduleOnce(
+            id: nextId++,
+            when: dayBeforeAt9,
+            title: '🛁 ${pet.name} 미용 예약 안내',
+            body: '내일은 ${pet.name} 미용 예약일이에요',
+            payload: 'grooming|${pet.id}',
+          );
+        }
+
+        final dueAt9 = DateTime(dueDate.year, dueDate.month, dueDate.day, 9);
+        if (dueAt9.isAfter(now)) {
+          await _scheduleOnce(
+            id: nextId++,
+            when: dueAt9,
+            title: '🛁 ${pet.name} 미용 예약일이에요',
+            body: '오늘은 ${pet.name} 미용 예약일이에요',
+            payload: 'grooming|${pet.id}',
+          );
+        }
+      }
+
+      // 발정기 알림. 중성화된 펫은 호출자가 빈 리스트를 넘기므로 자연스럽게 스킵됨.
+      final heatCycles = heatCyclesByPetId[pet.id] ?? const <HeatCycle>[];
+      for (final h in heatCycles) {
+        final next = h.nextExpected;
+        if (next == null) continue;
+        final nextDate = DateTime(next.year, next.month, next.day);
+        final dayBefore = nextDate.subtract(const Duration(days: 1));
+        final dayBeforeAt9 = DateTime(
+          dayBefore.year,
+          dayBefore.month,
+          dayBefore.day,
+          9,
+        );
+        if (dayBeforeAt9.isAfter(now)) {
+          await _scheduleOnce(
+            id: nextId++,
+            when: dayBeforeAt9,
+            title: '🌸 ${pet.name} 발정기가 다가오고 있어요',
+            body: '내일은 ${pet.name} 예상 발정일이에요',
+            payload: 'heat|${pet.id}',
+          );
+        }
+
+        final atDay9 =
+            DateTime(nextDate.year, nextDate.month, nextDate.day, 9);
+        if (atDay9.isAfter(now)) {
+          await _scheduleOnce(
+            id: nextId++,
+            when: atDay9,
+            title: '🌸 ${pet.name} 발정기가 다가오고 있어요',
+            body: '오늘은 ${pet.name} 예상 발정일이에요',
+            payload: 'heat|${pet.id}',
+          );
+        }
+      }
+
+      // 할 일(todo) 알림. 반복 타입에 따라 일회성/매일/매주/매월 예약.
+      final petTodos = todos.where((t) => t.petId == pet.id).toList();
+      for (final t in petTodos) {
+        await _scheduleTodo(pet: pet, todo: t, now: now);
+      }
+
+      // 케이지 관리(청소·먹이·물) 매일 반복 알림.
+      final cageSchedules =
+          cageSchedulesByPetId[pet.id] ?? const <CageSchedule>[];
+      for (final sched in cageSchedules) {
+        if (!sched.enabled) continue;
+        for (final raw in sched.reminderTimes) {
+          final parsed = _parseHourMinute(raw);
+          if (parsed == null) continue;
+          await _scheduleRepeating(
+            id: _cageId(sched.id, sched.type, parsed.hour, parsed.minute),
+            title: '${sched.type.emoji} ${pet.name} ${sched.type.reminderTitle}',
+            body: '정해진 시각에 알림으로 알려드릴게요',
+            hour: parsed.hour,
+            minute: parsed.minute,
+            weekday: null,
+            payload: 'cage_${sched.type.apiValue}|${pet.id}',
+          );
+        }
+      }
+    }
+  }
+
+  // 시니어 펫 정기 검진 알림.
+  // - 마지막 vet_visits가 180일 이상 지났으면 예약.
+  // - 병원 기록이 없으면 입양일을 기준으로 180일 체크.
+  // - 알림 ID는 pet_id 해시로 고정해 중복 예약을 방지.
+  // - 발화는 오늘 10시(이미 지났으면 내일 10시)로 1회성 예약.
+  Future<void> _scheduleCheckupReminderIfDue({
+    required Pet pet,
+    required List<VetVisit> vetVisits,
+    required DateTime today,
+  }) async {
+    DateTime? latestVisit;
+    for (final v in vetVisits) {
+      if (latestVisit == null || v.visitedAt.isAfter(latestVisit)) {
+        latestVisit = v.visitedAt;
+      }
+    }
+    final reference = latestVisit ?? pet.adoptionDate;
+    final referenceDay = DateTime(reference.year, reference.month, reference.day);
+    final elapsed = today.difference(referenceDay);
+    if (elapsed < _checkupOverdueAfter) return;
+
+    final id = _checkupId(pet.id);
+    final now = tz.TZDateTime.now(tz.local);
+    var scheduled = tz.TZDateTime(
+      tz.local,
+      now.year,
+      now.month,
+      now.day,
+      10,
+      0,
+    );
+    if (!scheduled.isAfter(now)) {
+      scheduled = scheduled.add(const Duration(days: 1));
+    }
+
+    try {
+      await _plugin.zonedSchedule(
+        id: id,
+        title: '🏥 ${pet.name} 정기 검진 시기예요',
+        body: '마지막 병원 방문 후 6개월이 지났어요. 시니어 반려동물은 정기 검진이 중요해요.',
+        scheduledDate: scheduled,
+        notificationDetails: _details,
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        payload: 'vet_visit|${pet.id}',
+      );
+    } catch (_) {
+      // 권한 미부여 등으로 실패할 수 있으나 무시.
+    }
+  }
+
+  int _checkupId(String petId) {
+    var h = 0x811C9DC5;
+    for (var i = 0; i < petId.length; i++) {
+      h ^= petId.codeUnitAt(i) & 0xFF;
+      h = (h * 0x01000193) & 0x1FFFFFFF;
+    }
+    return _checkupIdMask | (h & 0x1FFFFFFF);
+  }
+
+  Future<void> _scheduleDailyHealthCheck({
+    required int id,
+    required Pet pet,
+    required bool loggedToday,
+  }) async {
+    final now = tz.TZDateTime.now(tz.local);
+    var scheduled = tz.TZDateTime(
+      tz.local,
+      now.year,
+      now.month,
+      now.day,
+      20,
+      0,
+    );
+    if (!scheduled.isAfter(now)) {
+      scheduled = scheduled.add(const Duration(days: 1));
+    }
+    final isToday = scheduled.year == now.year &&
+        scheduled.month == now.month &&
+        scheduled.day == now.day;
+    if (loggedToday && isToday) {
+      scheduled = scheduled.add(const Duration(days: 1));
+    }
+
+    try {
+      await _plugin.zonedSchedule(
+        id: id,
+        title: '🏥 ${pet.name} 오늘 건강 체크 했나요?',
+        body: '식욕·활동량·수면을 1분 안에 기록해보세요',
+        scheduledDate: scheduled,
+        notificationDetails: _details,
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        matchDateTimeComponents: DateTimeComponents.time,
+        payload: 'daily_health|${pet.id}',
+      );
+    } catch (_) {
+      // 권한 미부여 등으로 실패할 수 있으나 무시.
     }
   }
 
@@ -334,6 +565,95 @@ class NotificationService {
         );
       }
     }
+  }
+
+  Future<void> _scheduleTodo({
+    required Pet pet,
+    required TodoItem todo,
+    required DateTime now,
+  }) async {
+    if (todo.isDone) return;
+    final hour = todo.reminderHour;
+    final minute = todo.reminderMinute;
+    if (hour == null || minute == null) return;
+
+    final title = '✅ ${todo.title} 할 시간이에요';
+    final body = '${pet.name} 할 일이에요';
+    final payload = 'todo|${pet.id}';
+
+    switch (todo.repeatType) {
+      case TodoRepeatType.none:
+        final due = todo.dueDate;
+        if (due == null) return;
+        final when = DateTime(due.year, due.month, due.day, hour, minute);
+        if (!when.isAfter(now)) return;
+        await _scheduleOnce(
+          id: _todoId(todo.id, hour, minute, 0),
+          when: when,
+          title: title,
+          body: body,
+          payload: payload,
+        );
+      case TodoRepeatType.daily:
+        await _scheduleRepeating(
+          id: _todoId(todo.id, hour, minute, 0),
+          title: title,
+          body: body,
+          hour: hour,
+          minute: minute,
+          weekday: null,
+          payload: payload,
+        );
+      case TodoRepeatType.weekly:
+        final weekdays = <int>{};
+        for (final w in todo.repeatWeekdays) {
+          if (w >= 1 && w <= 7) weekdays.add(w);
+        }
+        for (final w in weekdays) {
+          await _scheduleRepeating(
+            id: _todoId(todo.id, hour, minute, w),
+            title: title,
+            body: body,
+            hour: hour,
+            minute: minute,
+            weekday: w,
+            payload: payload,
+          );
+        }
+      case TodoRepeatType.monthly:
+        // flutter_local_notifications는 monthly 매칭이 없어 다음 N개월치를
+        // 일회성으로 예약. 다음 6회분만 예약(다음 회차들은 이후 reschedule에서 갱신).
+        final due = todo.dueDate;
+        if (due == null) return;
+        final start = DateTime(due.year, due.month, due.day, hour, minute);
+        for (var i = 0; i < 6; i++) {
+          final next = DateTime(start.year, start.month + i, start.day, hour, minute);
+          if (!next.isAfter(now)) continue;
+          await _scheduleOnce(
+            id: _todoId(todo.id, hour, minute, i + 100),
+            when: next,
+            title: title,
+            body: body,
+            payload: payload,
+          );
+        }
+    }
+  }
+
+  int _todoId(String todoId, int hour, int minute, int extra) {
+    var h = 0x811C9DC5;
+    void mix(int value) {
+      h ^= value & 0xFF;
+      h = (h * 0x01000193) & 0x07FFFFFF;
+    }
+
+    for (var i = 0; i < todoId.length; i++) {
+      mix(todoId.codeUnitAt(i));
+    }
+    mix(hour);
+    mix(minute);
+    mix(extra);
+    return _todoIdMask | (h & 0x07FFFFFF);
   }
 
   Future<void> _scheduleOnce({
@@ -438,6 +758,22 @@ class NotificationService {
     mix(minute);
     mix(weekday);
     return _medicationIdMask | (h & 0x3FFFFFFF);
+  }
+
+  int _cageId(String scheduleId, CageActivityType type, int hour, int minute) {
+    var h = 0x811C9DC5;
+    void mix(int value) {
+      h ^= value & 0xFF;
+      h = (h * 0x01000193) & 0x0FFFFFFF;
+    }
+
+    for (var i = 0; i < scheduleId.length; i++) {
+      mix(scheduleId.codeUnitAt(i));
+    }
+    mix(type.index);
+    mix(hour);
+    mix(minute);
+    return _cageIdMask | (h & 0x0FFFFFFF);
   }
 
   _HourMinute? _parseHourMinute(String raw) {

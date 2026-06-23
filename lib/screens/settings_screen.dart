@@ -4,12 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-import '../models/medication.dart';
 import '../models/pet.dart';
-import '../models/vaccination.dart';
 import '../services/auth_service.dart';
 import '../services/export_service.dart';
 import '../services/notification_service.dart';
+import '../services/reminder_scheduler.dart';
 import '../services/supabase_service.dart';
 import '../theme/theme_controller.dart';
 import 'feedback_screen.dart';
@@ -33,6 +32,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _toggling = false;
   bool _signingOut = false;
   bool _exporting = false;
+  bool _seniorManualOn = false;
+  bool _seniorToggling = false;
   StreamSubscription<AuthState>? _authSub;
 
   @override
@@ -42,6 +43,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _authSub = AuthService.instance.onAuthStateChange.listen((_) {
       if (mounted) setState(() {});
     });
+    _loadSeniorManualOn();
+  }
+
+  Future<void> _loadSeniorManualOn() async {
+    final pet = widget.selectedPet;
+    if (pet == null) return;
+    final value = await SeniorModeStore.isManualOn(pet.id);
+    if (!mounted) return;
+    setState(() {
+      _seniorManualOn = value;
+    });
+  }
+
+  Future<void> _onToggleSeniorManual(bool value) async {
+    final pet = widget.selectedPet;
+    if (pet == null || _seniorToggling) return;
+    setState(() {
+      _seniorToggling = true;
+    });
+    try {
+      await SeniorModeStore.setManualOn(pet.id, value);
+      if (!mounted) return;
+      setState(() {
+        _seniorManualOn = value;
+        _seniorToggling = false;
+      });
+      await _rescheduleAfterSeniorChange();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _seniorToggling = false;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('시니어 모드 변경 실패: $e')));
+    }
+  }
+
+  Future<void> _rescheduleAfterSeniorChange() async {
+    await rescheduleAllReminders(_service);
   }
 
   @override
@@ -141,22 +182,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await service.setEnabled(value);
 
       if (value && service.isSupported) {
-        try {
-          final pets = await _service.fetchPets();
-          final vacByPet = <String, List<Vaccination>>{};
-          final medByPet = <String, List<Medication>>{};
-          for (final p in pets) {
-            vacByPet[p.id] = await _service.fetchVaccinations(p.id);
-            medByPet[p.id] = await _service.fetchMedications(p.id);
-          }
-          await service.rescheduleAll(
-            pets: pets,
-            vaccinationsByPetId: vacByPet,
-            medicationsByPetId: medByPet,
-          );
-        } catch (_) {
-          // 재예약 실패는 토글 자체에 영향을 주지 않도록 무시.
-        }
+        // 시니어 펫 매일 건강 체크 알림도 함께 재예약.
+        await _rescheduleAfterSeniorChange();
       }
 
       if (!mounted) return;
@@ -253,8 +280,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final supported = service.isSupported;
     final auth = AuthService.instance;
 
+    final pet = widget.selectedPet;
+    final showSeniorToggle = pet != null && pet.birthday == null;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('설정')),
+      appBar: AppBar(title: const Text('⚙️ 설정')),
       body: ListView(
         children: [
           _buildAccountSection(auth, colorScheme, textTheme),
@@ -274,6 +304,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onChanged: supported && !_toggling ? _onToggleNotifications : null,
           ),
           const Divider(height: 1),
+          if (showSeniorToggle) ...[
+            SwitchListTile(
+              secondary: Icon(
+                Icons.elderly_outlined,
+                color: colorScheme.primary,
+              ),
+              title: Text('${pet.name} 시니어 모드'),
+              subtitle: const Text(
+                '생일이 없어 입양일로 추정 중이에요. 시니어 펫인데 자동 판정이 틀렸다면 켜주세요.',
+              ),
+              value: _seniorManualOn,
+              onChanged: _seniorToggling ? null : _onToggleSeniorManual,
+            ),
+            const Divider(height: 1),
+          ],
           ListTile(
             leading: Icon(
               Icons.palette_outlined,

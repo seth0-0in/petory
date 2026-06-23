@@ -1,15 +1,18 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/log_entry.dart';
-import '../models/medication.dart';
+import '../models/log_media.dart';
 import '../models/pet.dart';
 import '../models/vaccination.dart';
 import '../services/auth_service.dart';
 import '../services/notification_service.dart';
+import '../services/pet_session.dart';
+import '../services/reminder_scheduler.dart';
 import '../services/supabase_service.dart';
 import 'add_log_screen.dart';
 import 'calendar_screen.dart';
@@ -17,18 +20,19 @@ import 'care_tips_screen.dart';
 import 'edit_pet_screen.dart';
 import 'family_share_screen.dart';
 import 'gallery_screen.dart';
-import 'health_screen.dart';
+import 'log_detail_screen.dart';
 import 'milestones_screen.dart';
-import 'nearby_vet_sheet.dart';
-import 'photo_view_screen.dart';
-import 'settings_screen.dart';
 import 'sign_in_screen.dart';
 import 'sign_up_screen.dart';
+import 'todo_screen.dart';
 
 const String _kGuestBannerDismissedPrefsKey = 'guest_banner_dismissed';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  // 하단 탭 전환 콜백 (MainScreen이 주입). null이면 탭 전환 동작 없음.
+  final void Function(int tabIndex)? onNavigateToTab;
+
+  const HomeScreen({super.key, this.onNavigateToTab});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -36,24 +40,20 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final SupabaseService _service = SupabaseService();
+  final ImagePicker _picker = ImagePicker();
 
   List<Pet> _pets = [];
   Pet? _selectedPet;
   List<LogEntry> _logs = [];
   List<Vaccination> _vaccinations = [];
+  int _todayTodoCount = 0;
+  bool _seniorManualOn = false;
   bool _loading = true;
-  bool _logsLoading = false;
   String? _error;
-  bool _promptingOverdue = false;
-
-  bool _searchVisible = false;
-  final TextEditingController _searchController = TextEditingController();
-  String _searchQuery = '';
-  DateTimeRange? _dateRange;
+  bool _uploadingAvatar = false;
 
   StreamSubscription<AuthState>? _authSub;
   String? _lastAuthUserId;
-
   bool _guestBannerDismissed = false;
 
   @override
@@ -62,12 +62,16 @@ class _HomeScreenState extends State<HomeScreen> {
     _lastAuthUserId = AuthService.instance.currentUser?.id;
     _load();
     _loadGuestBannerState();
-    NotificationService.instance.tapNotifier.addListener(_onNotificationTap);
     _authSub = AuthService.instance.onAuthStateChange.listen(_onAuthChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _maybeRequestNotificationPermission();
-      _onNotificationTap();
     });
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadGuestBannerState() async {
@@ -89,42 +93,24 @@ class _HomeScreenState extends State<HomeScreen> {
     await prefs.setBool(_kGuestBannerDismissedPrefsKey, true);
   }
 
-  Future<void> _openSignUpFromBanner() async {
-    await Navigator.push<bool>(
-      context,
-      MaterialPageRoute(builder: (_) => const SignUpScreen()),
-    );
-    if (!mounted) return;
-    // 계정 전환에 성공했다면 isAnonymous가 false가 되어 배너가 자동으로 사라짐.
-    setState(() {});
-  }
-
   bool get _shouldShowGuestBanner =>
       AuthService.instance.isAnonymous &&
       _pets.isNotEmpty &&
       !_guestBannerDismissed;
-
-  @override
-  void dispose() {
-    _authSub?.cancel();
-    NotificationService.instance.tapNotifier.removeListener(_onNotificationTap);
-    _searchController.dispose();
-    super.dispose();
-  }
 
   void _onAuthChanged(AuthState state) {
     final newId = state.session?.user.id;
     if (newId == _lastAuthUserId) return;
     _lastAuthUserId = newId;
     if (!mounted) return;
-    // 사용자가 바뀌면 펫·기록을 모두 다시 불러오고, 알림도 새 사용자 기준으로 재예약.
     setState(() {
       _pets = [];
       _selectedPet = null;
       _logs = [];
       _vaccinations = [];
-      _resetFilters();
+      _seniorManualOn = false;
     });
+    PetSession.instance.clear();
     _load();
   }
 
@@ -132,65 +118,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final service = NotificationService.instance;
     if (!service.isSupported || !service.enabled) return;
     await service.requestPermissions();
-  }
-
-  void _onNotificationTap() {
-    final tap = NotificationService.instance.tapNotifier.value;
-    if (tap == null) return;
-    NotificationService.instance.consumeTap();
-    if (!mounted) return;
-
-    Pet? target;
-    for (final p in _pets) {
-      if (p.id == tap.petId) {
-        target = p;
-        break;
-      }
-    }
-    if (target == null) return;
-
-    Future<void> jump() async {
-      await _selectPet(target!);
-      if (!mounted) return;
-      if (tap.type == 'health') {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => HealthScreen(petId: target!.id, initialTab: 1),
-          ),
-        );
-      } else if (tap.type == 'medication') {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => HealthScreen(petId: target!.id, initialTab: 2),
-          ),
-        );
-      }
-    }
-
-    jump();
-  }
-
-  Future<void> _rescheduleNotifications() async {
-    final service = NotificationService.instance;
-    if (!service.isSupported || !service.enabled) return;
-    try {
-      final pets = await _service.fetchPets();
-      final vacByPet = <String, List<Vaccination>>{};
-      final medByPet = <String, List<Medication>>{};
-      for (final p in pets) {
-        vacByPet[p.id] = await _service.fetchVaccinations(p.id);
-        medByPet[p.id] = await _service.fetchMedications(p.id);
-      }
-      await service.rescheduleAll(
-        pets: pets,
-        vaccinationsByPetId: vacByPet,
-        medicationsByPetId: medByPet,
-      );
-    } catch (_) {
-      // 알림 재예약 실패는 UX에 영향을 주지 않도록 무시.
-    }
   }
 
   Future<void> _load() async {
@@ -203,14 +130,17 @@ class _HomeScreenState extends State<HomeScreen> {
       Pet? selected;
       List<LogEntry> logs = [];
       List<Vaccination> vaccinations = [];
+      bool seniorManualOn = false;
       if (pets.isNotEmpty) {
         selected = pets.first;
         final results = await Future.wait([
           _service.fetchLogs(selected.id),
           _service.fetchVaccinations(selected.id),
+          SeniorModeStore.isManualOn(selected.id),
         ]);
         logs = results[0] as List<LogEntry>;
         vaccinations = results[1] as List<Vaccination>;
+        seniorManualOn = results[2] as bool;
       }
       if (!mounted) return;
       setState(() {
@@ -218,11 +148,13 @@ class _HomeScreenState extends State<HomeScreen> {
         _selectedPet = selected;
         _logs = logs;
         _vaccinations = vaccinations;
+        _seniorManualOn = seniorManualOn;
         _loading = false;
       });
-      _scheduleOverduePrompts();
+      PetSession.instance.setPets(pets);
+      PetSession.instance.setSelectedPet(selected);
       _rescheduleNotifications();
-      _onNotificationTap();
+      _refreshTodayTodoCount();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -232,65 +164,42 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _refreshTodayTodoCount() async {
+    final count = await countTodayOpenTodos(_service);
+    if (!mounted) return;
+    setState(() {
+      _todayTodoCount = count;
+    });
+  }
+
+  Future<void> _rescheduleNotifications() async {
+    await rescheduleAllReminders(_service);
+  }
+
   Future<void> _selectPet(Pet pet) async {
-    if (_selectedPet?.id == pet.id) return;
     setState(() {
       _selectedPet = pet;
       _logs = [];
       _vaccinations = [];
-      _logsLoading = true;
-      _resetFilters();
     });
+    PetSession.instance.setSelectedPet(pet);
     try {
       final results = await Future.wait([
         _service.fetchLogs(pet.id),
         _service.fetchVaccinations(pet.id),
+        SeniorModeStore.isManualOn(pet.id),
       ]);
       if (!mounted) return;
+      // 도중에 펫이 바뀌었으면 결과 무시.
+      if (_selectedPet?.id != pet.id) return;
       setState(() {
         _logs = results[0] as List<LogEntry>;
         _vaccinations = results[1] as List<Vaccination>;
-        _logsLoading = false;
+        _seniorManualOn = results[2] as bool;
       });
-      _scheduleOverduePrompts();
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _logsLoading = false;
-      });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('기록을 불러오지 못했어요: $e')));
+    } catch (_) {
+      // 무시.
     }
-  }
-
-  Future<void> _openEditPet(Pet pet) async {
-    final updated = await Navigator.push<Pet>(
-      context,
-      MaterialPageRoute(builder: (_) => EditPetScreen(pet: pet)),
-    );
-    if (updated == null) return;
-    if (!mounted) return;
-    setState(() {
-      final i = _pets.indexWhere((p) => p.id == updated.id);
-      if (i != -1) _pets[i] = updated;
-      if (_selectedPet?.id == updated.id) _selectedPet = updated;
-    });
-    _rescheduleNotifications();
-  }
-
-  Future<void> _openCreatePet() async {
-    final created = await Navigator.push<Pet>(
-      context,
-      MaterialPageRoute(builder: (_) => const EditPetScreen()),
-    );
-    if (created == null) return;
-    if (!mounted) return;
-    setState(() {
-      _pets = [..._pets, created];
-    });
-    await _selectPet(created);
-    _rescheduleNotifications();
   }
 
   Future<void> _openPetPicker() async {
@@ -304,7 +213,8 @@ class _HomeScreenState extends State<HomeScreen> {
             children: [
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                child: Text('펫 선택', style: Theme.of(ctx).textTheme.titleMedium),
+                child:
+                    Text('펫 선택', style: Theme.of(ctx).textTheme.titleMedium),
               ),
               for (final p in _pets)
                 _PetPickerTile(
@@ -352,7 +262,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final left = await Navigator.push<bool>(
       context,
       MaterialPageRoute(
-        builder: (_) => FamilyShareScreen(petId: pet.id, petName: pet.name),
+        builder: (_) =>
+            FamilyShareScreen(petId: pet.id, petName: pet.name),
       ),
     );
     if (left == true) {
@@ -372,8 +283,8 @@ class _HomeScreenState extends State<HomeScreen> {
             Text(
               '가족이 공유한 초대 코드를 입력하세요.',
               style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
-                color: Theme.of(ctx).colorScheme.onSurfaceVariant,
-              ),
+                    color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
             ),
             const SizedBox(height: 12),
             TextField(
@@ -396,88 +307,129 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const Text('취소'),
           ),
           FilledButton(
-            onPressed: () =>
-                Navigator.pop(ctx, controller.text.trim()),
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
             child: const Text('참여'),
           ),
         ],
       ),
     );
-    controller.dispose();
     if (code == null || code.isEmpty) return;
-    if (!mounted) return;
-
     try {
-      final joined = await _service.redeemPetInvite(code);
+      final res = await _service.redeemPetInvite(code);
       if (!mounted) return;
-      final pets = await _service.fetchPets();
-      if (!mounted) return;
-      Pet? joinedPet;
-      for (final p in pets) {
-        if (p.id == joined.petId) {
-          joinedPet = p;
-          break;
-        }
-      }
-      setState(() {
-        _pets = pets;
-      });
-      if (joinedPet != null) {
-        await _selectPet(joinedPet);
-      }
-      if (!mounted) return;
-      final petName = joined.petName ?? joinedPet?.name;
-      final message = petName == null
-          ? '가족 공유에 참여했어요.'
-          : '$petName 가족 공유에 참여했어요.';
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-      _rescheduleNotifications();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            res.petName == null ? '참여했어요!' : '${res.petName}의 가족이 되었어요!',
+          ),
+        ),
+      );
+      await _load();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(_humanizeInviteError(e))));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('참여 실패: $e')),
+      );
     }
   }
 
-  String _humanizeInviteError(Object error) {
-    final msg = error.toString().toLowerCase();
-    if (msg.contains('expired')) return '만료된 초대 코드예요.';
-    if (msg.contains('not found') ||
-        msg.contains('invalid') ||
-        msg.contains('no rows')) {
-      return '유효하지 않은 초대 코드예요.';
+  Future<void> _openCreatePet() async {
+    final created = await Navigator.push<Pet>(
+      context,
+      MaterialPageRoute(builder: (_) => const EditPetScreen()),
+    );
+    if (created == null) return;
+    if (!mounted) return;
+    setState(() {
+      _pets = [..._pets, created];
+    });
+    PetSession.instance.setPets(_pets);
+    await _selectPet(created);
+    _rescheduleNotifications();
+  }
+
+  Future<void> _openEditPet(Pet pet) async {
+    final updated = await Navigator.push<Pet>(
+      context,
+      MaterialPageRoute(builder: (_) => EditPetScreen(pet: pet)),
+    );
+    if (updated == null) return;
+    if (!mounted) return;
+    setState(() {
+      _pets = _pets.map((p) => p.id == updated.id ? updated : p).toList();
+      if (_selectedPet?.id == updated.id) {
+        _selectedPet = updated;
+      }
+    });
+    PetSession.instance.setPets(_pets);
+    if (PetSession.instance.selectedPet.value?.id == updated.id) {
+      PetSession.instance.setSelectedPet(updated);
     }
-    if (msg.contains('already')) return '이미 이 펫의 멤버예요.';
-    return '참여하지 못했어요: $error';
+    PetSession.instance.bumpRev();
+    _rescheduleNotifications();
   }
 
-  void _openHealth() {
-    final pet = _selectedPet;
-    if (pet == null) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => HealthScreen(petId: pet.id)),
+  void _openSearchTab() {
+    widget.onNavigateToTab?.call(1);
+  }
+
+  Future<void> _changeProfileImage(Pet pet) async {
+    if (_uploadingAvatar) return;
+    final picked = await _picker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1200,
+      maxHeight: 1200,
+      imageQuality: 85,
     );
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    final mime = picked.mimeType ?? 'image/jpeg';
+    final extIdx = picked.name.lastIndexOf('.');
+    final ext = (extIdx > 0 && extIdx < picked.name.length - 1)
+        ? picked.name.substring(extIdx + 1).toLowerCase()
+        : 'jpg';
+
+    setState(() {
+      _uploadingAvatar = true;
+    });
+    try {
+      final url = await _service.uploadPetProfileImage(
+        bytes,
+        petId: pet.id,
+        contentType: mime,
+        extension: ext,
+      );
+      final updated = await _service.updatePetProfileImage(pet.id, url);
+      if (!mounted) return;
+      setState(() {
+        _pets = _pets.map((p) => p.id == updated.id ? updated : p).toList();
+        if (_selectedPet?.id == updated.id) _selectedPet = updated;
+        _uploadingAvatar = false;
+      });
+      PetSession.instance.setPets(_pets);
+      if (PetSession.instance.selectedPet.value?.id == updated.id) {
+        PetSession.instance.setSelectedPet(updated);
+      }
+      PetSession.instance.bumpRev();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _uploadingAvatar = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('프로필 사진 변경 실패: $e')),
+      );
+    }
   }
 
-  void _openCareTips() {
+  void _openCalendar() {
     final pet = _selectedPet;
     if (pet == null) return;
     Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => CareTipsScreen(pet: pet)),
-    );
-  }
-
-  void _openMilestones() {
-    final pet = _selectedPet;
-    if (pet == null) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => MilestonesScreen(petId: pet.id)),
+      MaterialPageRoute(
+        builder: (_) => CalendarScreen(pet: pet),
+      ),
     );
   }
 
@@ -490,437 +442,162 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  void _openCalendar() {
+  void _openMilestones() {
     final pet = _selectedPet;
     if (pet == null) return;
     Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => CalendarScreen(pet: pet)),
+      MaterialPageRoute(builder: (_) => MilestonesScreen(petId: pet.id)),
     );
+  }
+
+  void _openCareTips() {
+    final pet = _selectedPet;
+    if (pet == null) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => CareTipsScreen(pet: pet)),
+    );
+  }
+
+  Future<void> _openTodos() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => TodoScreen(
+          pets: _pets,
+          defaultPet: _selectedPet,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    _refreshTodayTodoCount();
   }
 
   Future<void> _openAddLog() async {
     final pet = _selectedPet;
     if (pet == null) return;
-
-    final saved = await Navigator.push<LogEntry>(
-      context,
-      MaterialPageRoute(builder: (_) => AddLogScreen(petId: pet.id)),
-    );
-    if (saved == null) return;
-    if (!mounted) return;
-    setState(() {
-      _logs.insert(0, saved);
-    });
-  }
-
-  Future<void> _openEditLog(LogEntry log) async {
-    final pet = _selectedPet;
-    if (pet == null) return;
-
-    final updated = await Navigator.push<LogEntry>(
+    final result = await Navigator.push<LogEntry>(
       context,
       MaterialPageRoute(
-        builder: (_) => AddLogScreen(petId: pet.id, existing: log),
+        builder: (_) => AddLogScreen(petId: pet.id),
       ),
     );
-    if (updated == null) return;
+    if (result == null) return;
     if (!mounted) return;
     setState(() {
-      final i = _logs.indexWhere((l) => l.id == updated.id);
-      if (i != -1) {
-        _logs[i] = updated;
-      }
+      _logs = [result, ..._logs];
     });
   }
 
-  Future<void> _confirmDeleteLog(LogEntry log) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('기록 삭제'),
-        content: const Text('이 기록을 삭제할까요?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('취소'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('삭제'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-
-    try {
-      await _service.deleteLog(log.id);
-      if (!mounted) return;
-      setState(() {
-        _logs = _logs.where((l) => l.id != log.id).toList();
-      });
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('삭제 실패: $e')));
-    }
-  }
-
-  void _resetFilters() {
-    _searchVisible = false;
-    _searchController.clear();
-    _searchQuery = '';
-    _dateRange = null;
-  }
-
-  bool get _hasActiveFilter =>
-      _searchQuery.trim().isNotEmpty || _dateRange != null;
-
-  List<LogEntry> get _filteredLogs {
-    final query = _searchQuery.trim().toLowerCase();
-    final range = _dateRange;
-    if (query.isEmpty && range == null) return _logs;
-
-    DateTime? startDate;
-    DateTime? endDate;
-    if (range != null) {
-      startDate = DateTime(
-        range.start.year,
-        range.start.month,
-        range.start.day,
-      );
-      endDate = DateTime(range.end.year, range.end.month, range.end.day);
-    }
-
-    return _logs.where((log) {
-      if (query.isNotEmpty && !log.content.toLowerCase().contains(query)) {
-        return false;
-      }
-      if (startDate != null && endDate != null) {
-        final local = log.createdAt.toLocal();
-        final logDate = DateTime(local.year, local.month, local.day);
-        if (logDate.isBefore(startDate) || logDate.isAfter(endDate)) {
-          return false;
-        }
-      }
-      return true;
-    }).toList();
-  }
-
-  void _toggleSearch() {
-    setState(() {
-      if (_searchVisible) {
-        _resetFilters();
-      } else {
-        _searchVisible = true;
-      }
-    });
-  }
-
-  Future<void> _pickDateRange() async {
-    final now = DateTime.now();
-    final picked = await showDateRangePicker(
-      context: context,
-      firstDate: DateTime(now.year - 20),
-      lastDate: DateTime(now.year + 1, 12, 31),
-      initialDateRange: _dateRange,
-      helpText: '기간 선택',
-    );
-    if (picked == null) return;
-    if (!mounted) return;
-    setState(() {
-      _dateRange = picked;
-    });
-  }
-
-  String _formatDateRangeLabel(DateTimeRange r) {
-    final s = _formatDate(r.start);
-    final e = _formatDate(r.end);
-    if (s == e) return s;
-    return '$s ~ $e';
-  }
-
-  String _formatDate(DateTime dt) {
-    final local = dt.toLocal();
-    final y = local.year.toString().padLeft(4, '0');
-    final m = local.month.toString().padLeft(2, '0');
-    final d = local.day.toString().padLeft(2, '0');
-    return '$y.$m.$d';
-  }
-
-  void _scheduleOverduePrompts() {
-    if (_promptingOverdue) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _handleOverdueVaccinations();
-    });
-  }
-
-  Future<void> _handleOverdueVaccinations() async {
-    if (_promptingOverdue) return;
-    if (!mounted) return;
-
-    final petAtStart = _selectedPet;
-    if (petAtStart == null) return;
-
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    final candidates = <Vaccination>[];
-    for (final v in _vaccinations) {
-      if (!v.isScheduled) continue;
-      final due = v.nextDueAt!;
-      final dueOnly = DateTime(due.year, due.month, due.day);
-      final days = dueOnly.difference(today).inDays;
-      if (days >= -3 && days <= 3) {
-        candidates.add(v);
-      }
-    }
-    if (candidates.isEmpty) return;
-    candidates.sort((a, b) => a.nextDueAt!.compareTo(b.nextDueAt!));
-
-    _promptingOverdue = true;
-    try {
-      for (final v in candidates) {
-        if (!mounted) return;
-        if (_selectedPet?.id != petAtStart.id) return;
-
-        final didIt = await showDialog<bool>(
-          context: context,
-          barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            title: const Text('예방접종 확인'),
-            content: Text('${v.name} 예방접종 맞았나요?'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('아니오'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('예'),
-              ),
-            ],
-          ),
-        );
-        if (!mounted) return;
-        if (_selectedPet?.id != petAtStart.id) return;
-        if (didIt != true) continue;
-
-        final hasNext = await showDialog<bool>(
-          context: context,
-          barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            title: const Text('다음 접종'),
-            content: Text('다음 ${v.name} 접종일이 있나요?'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('없어요'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('있어요'),
-              ),
-            ],
-          ),
-        );
-        if (!mounted) return;
-        if (_selectedPet?.id != petAtStart.id) return;
-
-        DateTime? nextDue;
-        if (hasNext == true) {
-          final today2 = DateTime(now.year, now.month, now.day);
-          nextDue = await showDatePicker(
-            context: context,
-            initialDate: today2,
-            firstDate: today2,
-            lastDate: DateTime(today2.year + 10),
-            helpText: '${v.name} 다음 예정일',
-          );
-          if (!mounted) return;
-          if (_selectedPet?.id != petAtStart.id) return;
-        }
-
-        try {
-          await _service.completeVaccination(v.id, nextDue: nextDue);
-          if (!mounted) return;
-          if (_selectedPet?.id != petAtStart.id) return;
-          final reloaded = await _service.fetchVaccinations(petAtStart.id);
-          if (!mounted) return;
-          if (_selectedPet?.id != petAtStart.id) return;
-          setState(() {
-            _vaccinations = reloaded;
-          });
-          _rescheduleNotifications();
-        } catch (e) {
-          if (!mounted) return;
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('업데이트 실패: $e')));
-        }
-      }
-    } finally {
-      _promptingOverdue = false;
-    }
-  }
-
-  List<_VaccinationAlert> _vaccinationAlerts() {
-    final now = DateTime.now();
-    final today = DateTime(now.year, now.month, now.day);
-    final alerts = <_VaccinationAlert>[];
-    for (final v in _vaccinations) {
-      if (!v.isScheduled) continue;
-      final due = v.nextDueAt!;
-      final dueOnly = DateTime(due.year, due.month, due.day);
-      final days = dueOnly.difference(today).inDays;
-      if (days >= 0 && days <= 14) {
-        alerts.add(_VaccinationAlert(v, days));
-      }
-    }
-    alerts.sort((a, b) => a.daysUntil.compareTo(b.daysUntil));
-    return alerts.take(2).toList();
-  }
-
-  void _openVaccinationsTab() {
+  void _openLogDetail(LogEntry log) {
     final pet = _selectedPet;
     if (pet == null) return;
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => HealthScreen(petId: pet.id, initialTab: 1),
+        builder: (_) => LogDetailScreen(pet: pet, log: log),
       ),
     );
   }
 
+  // 가장 가까운 다가오는 기념일/생일/D-day 한 개를 계산.
   _Anniversary? _nextAnniversary(Pet pet) {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
+    _Anniversary? best;
+
+    void considerCandidate({
+      required String upcomingLabel,
+      required String todayLabel,
+      required DateTime date,
+    }) {
+      final d = DateTime(date.year, date.month, date.day);
+      if (d.isBefore(today)) return;
+      final diff = d.difference(today).inDays;
+      if (best == null || diff < best!.daysUntil) {
+        best = _Anniversary(
+          upcomingLabel: upcomingLabel,
+          todayLabel: todayLabel,
+          date: d,
+          daysUntil: diff,
+        );
+      }
+    }
+
     final adoption = DateTime(
       pet.adoptionDate.year,
       pet.adoptionDate.month,
       pet.adoptionDate.day,
     );
-
-    final candidates = <_Anniversary>[];
-
-    for (var n = 100; n <= 10000; n += 100) {
+    for (var n = 100; n <= 20000; n += 100) {
       final date = adoption.add(Duration(days: n - 1));
       if (date.isBefore(today)) continue;
-      candidates.add(
-        _Anniversary(
-          upcomingLabel: '입양 $n일',
-          todayLabel: '입양 $n일',
-          date: date,
-          daysUntil: date.difference(today).inDays,
-        ),
+      considerCandidate(
+        upcomingLabel: '입양 $n일',
+        todayLabel: '오늘은 입양 $n일!',
+        date: date,
       );
       break;
     }
-
     for (var n = 1; n <= 30; n++) {
-      final date = DateTime(adoption.year + n, adoption.month, adoption.day);
+      final date =
+          DateTime(adoption.year + n, adoption.month, adoption.day);
       if (date.isBefore(today)) continue;
-      candidates.add(
-        _Anniversary(
-          upcomingLabel: '입양 $n주년',
-          todayLabel: '입양 $n주년',
-          date: date,
-          daysUntil: date.difference(today).inDays,
-        ),
+      considerCandidate(
+        upcomingLabel: '입양 $n주년',
+        todayLabel: '오늘은 입양 $n주년!',
+        date: date,
       );
       break;
     }
-
     final bd = pet.birthday;
     if (bd != null) {
-      var bdate = DateTime(today.year, bd.month, bd.day);
-      if (bdate.isBefore(today)) {
-        bdate = DateTime(today.year + 1, bd.month, bd.day);
+      for (var n = 0; n <= 5; n++) {
+        final date = DateTime(today.year + n, bd.month, bd.day);
+        if (date.isBefore(today)) continue;
+        considerCandidate(
+          upcomingLabel: '${pet.name} 생일',
+          todayLabel: '오늘은 ${pet.name} 생일! 🎂',
+          date: date,
+        );
+        break;
       }
-      candidates.add(
-        _Anniversary(
-          upcomingLabel: '생일',
-          todayLabel: '생일',
-          date: bdate,
-          daysUntil: bdate.difference(today).inDays,
-        ),
-      );
     }
-
-    if (candidates.isEmpty) return null;
-    candidates.sort((a, b) => a.daysUntil.compareTo(b.daysUntil));
-    return candidates.first;
+    return best;
   }
 
-  Widget _buildDashboard(ColorScheme colorScheme, TextTheme textTheme) {
-    if (_logsLoading) return const SizedBox.shrink();
+  // 가장 임박한 미접종/접종 예정 백신 1개.
+  _VaccinationAlert? _topVaccinationAlert() {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    _VaccinationAlert? best;
+    for (final v in _vaccinations) {
+      if (v.administeredAt != null) continue;
+      final due = v.nextDueAt;
+      if (due == null) continue;
+      final dueDate = DateTime(due.year, due.month, due.day);
+      final diff = dueDate.difference(today).inDays;
+      // 14일 이내거나 이미 기한 지남.
+      if (diff > 14) continue;
+      if (best == null || diff < best!.daysUntil) {
+        best = _VaccinationAlert(
+          name: v.name,
+          dueDate: dueDate,
+          daysUntil: diff,
+        );
+      }
+    }
+    return best;
+  }
 
-    final pet = _selectedPet;
-    final alerts = _vaccinationAlerts();
-    final photoCount = _logs.where((l) => l.photoUrl != null).length;
-    final anniversary = pet == null ? null : _nextAnniversary(pet);
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          if (_shouldShowGuestBanner) ...[
-            _GuestAccountBanner(
-              colorScheme: colorScheme,
-              textTheme: textTheme,
-              onCreateAccount: _openSignUpFromBanner,
-              onDismiss: _dismissGuestBanner,
-            ),
-            const SizedBox(height: 8),
-          ],
-          if (anniversary != null && pet != null) ...[
-            _AnniversaryCard(
-              petName: pet.name,
-              anniversary: anniversary,
-              colorScheme: colorScheme,
-              textTheme: textTheme,
-              onTap: _openMilestones,
-            ),
-            const SizedBox(height: 8),
-          ],
-          for (final a in alerts) ...[
-            _VaccinationBanner(
-              alert: a,
-              colorScheme: colorScheme,
-              textTheme: textTheme,
-              onTap: _openVaccinationsTab,
-            ),
-            const SizedBox(height: 8),
-          ],
-          _NearbyVetButton(
-            colorScheme: colorScheme,
-            textTheme: textTheme,
-            onTap: () => showNearbyVetSheet(context),
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _StatChip(
-                icon: Icons.edit_note_outlined,
-                label: '기록 ${_logs.length}개',
-                colorScheme: colorScheme,
-                textTheme: textTheme,
-              ),
-              _StatChip(
-                icon: Icons.photo_outlined,
-                label: '사진 $photoCount장',
-                colorScheme: colorScheme,
-                textTheme: textTheme,
-              ),
-            ],
-          ),
-        ],
-      ),
+  Future<void> _openSignUpFromBanner() async {
+    await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(builder: (_) => const SignUpScreen()),
     );
+    if (!mounted) return;
+    setState(() {});
   }
 
   @override
@@ -931,7 +608,6 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_loading) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-
     if (_error != null) {
       return Scaffold(
         body: Center(
@@ -965,19 +641,6 @@ class _HomeScreenState extends State<HomeScreen> {
             '🐾 Petory',
             style: TextStyle(fontWeight: FontWeight.w600),
           ),
-          actions: [
-            IconButton(
-              tooltip: '설정',
-              icon: const Icon(Icons.settings_outlined),
-              color: colorScheme.primary,
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (_) => const SettingsScreen(selectedPet: null)),
-                );
-              },
-            ),
-          ],
         ),
         body: Center(
           child: Padding(
@@ -1029,162 +692,112 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     final pet = _selectedPet!;
+    final anniversary = _nextAnniversary(pet);
+    final topVacAlert = _topVaccinationAlert();
+    final recentLogs = _logs.take(3).toList();
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          '🐾 ${pet.name}의 하루',
-          style: const TextStyle(fontWeight: FontWeight.w600),
+        title: const Text(
+          '🐾 Petory',
+          style: TextStyle(fontWeight: FontWeight.w600),
         ),
         actions: [
-          IconButton(
-            tooltip: '설정',
-            icon: const Icon(Icons.settings_outlined),
-            color: colorScheme.primary,
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => SettingsScreen(selectedPet: pet),
-                ),
-              );
-            },
+          _TodoAppBarAction(
+            count: _todayTodoCount,
+            colorScheme: colorScheme,
+            onTap: _openTodos,
           ),
         ],
       ),
       body: SafeArea(
-        child: Column(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  InkWell(
-                    onTap: _openPetPicker,
-                    borderRadius: BorderRadius.circular(12),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 4),
-                      child: Row(
-                        children: [
-                          CircleAvatar(
-                            radius: 28,
-                            backgroundColor: colorScheme.primaryContainer,
-                            child: Text(
-                              pet.name.characters.first,
-                              style: textTheme.titleLarge?.copyWith(
-                                color: colorScheme.onPrimaryContainer,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Flexible(
-                                      child: Text(
-                                        pet.name,
-                                        style: textTheme.titleLarge,
-                                        overflow: TextOverflow.ellipsis,
-                                        maxLines: 1,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Icon(
-                                      Icons.arrow_drop_down,
-                                      color: colorScheme.onSurfaceVariant,
-                                    ),
-                                  ],
-                                ),
-                                Text(
-                                  '${pet.species} · 함께한 지',
-                                  style: textTheme.bodySmall,
-                                  overflow: TextOverflow.ellipsis,
-                                  maxLines: 1,
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            'D+${pet.daysSinceAdoption + 1}일',
-                            style: textTheme.titleLarge?.copyWith(
-                              fontWeight: FontWeight.bold,
-                              color: colorScheme.primary,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: Row(
-                      children: [
-                        IconButton(
-                          tooltip: _searchVisible ? '검색 닫기' : '기록 검색',
-                          icon: Icon(
-                            _searchVisible ? Icons.search_off : Icons.search,
-                          ),
-                          color: colorScheme.primary,
-                          visualDensity: VisualDensity.compact,
-                          onPressed: _toggleSearch,
-                        ),
-                        IconButton(
-                          tooltip: '캘린더',
-                          icon: const Icon(Icons.calendar_month_outlined),
-                          color: colorScheme.primary,
-                          visualDensity: VisualDensity.compact,
-                          onPressed: _openCalendar,
-                        ),
-                        IconButton(
-                          tooltip: '사진 갤러리',
-                          icon: const Icon(Icons.photo_library_outlined),
-                          color: colorScheme.primary,
-                          visualDensity: VisualDensity.compact,
-                          onPressed: _openGallery,
-                        ),
-                        IconButton(
-                          tooltip: '특별한 순간',
-                          icon: const Icon(Icons.celebration_outlined),
-                          color: colorScheme.primary,
-                          visualDensity: VisualDensity.compact,
-                          onPressed: _openMilestones,
-                        ),
-                        IconButton(
-                          tooltip: '건강 기록',
-                          icon: const Icon(Icons.monitor_heart_outlined),
-                          color: colorScheme.primary,
-                          visualDensity: VisualDensity.compact,
-                          onPressed: _openHealth,
-                        ),
-                        IconButton(
-                          tooltip: '케어 팁',
-                          icon: const Icon(Icons.tips_and_updates_outlined),
-                          color: colorScheme.primary,
-                          visualDensity: VisualDensity.compact,
-                          onPressed: _openCareTips,
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+            _buildPetHeader(pet, colorScheme, textTheme),
+            const SizedBox(height: 4),
+            _buildActionIcons(colorScheme),
+            const Divider(height: 24),
+            if (_shouldShowGuestBanner) ...[
+              _GuestAccountBanner(
+                colorScheme: colorScheme,
+                textTheme: textTheme,
+                onCreateAccount: _openSignUpFromBanner,
+                onDismiss: _dismissGuestBanner,
               ),
+              const SizedBox(height: 8),
+            ],
+            if (_todayTodoCount > 0) ...[
+              _TodayTodoBanner(
+                count: _todayTodoCount,
+                colorScheme: colorScheme,
+                textTheme: textTheme,
+                onTap: _openTodos,
+              ),
+              const SizedBox(height: 8),
+            ],
+            if (anniversary != null) ...[
+              _AnniversaryCard(
+                petName: pet.name,
+                anniversary: anniversary,
+                colorScheme: colorScheme,
+                textTheme: textTheme,
+                onTap: _openMilestones,
+              ),
+              const SizedBox(height: 8),
+            ],
+            if (topVacAlert != null) ...[
+              _VaccinationBanner(
+                alert: topVacAlert,
+                colorScheme: colorScheme,
+                textTheme: textTheme,
+                onTap: () => widget.onNavigateToTab?.call(2),
+              ),
+              const SizedBox(height: 8),
+            ],
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Icon(Icons.edit_note_outlined,
+                    size: 20, color: colorScheme.primary),
+                const SizedBox(width: 6),
+                Text(
+                  '최근 일기',
+                  style: textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: () => widget.onNavigateToTab?.call(1),
+                  child: const Text('전체 보기'),
+                ),
+              ],
             ),
-            const Divider(height: 1),
-            _buildDashboard(colorScheme, textTheme),
-            if (_searchVisible) _buildSearchBar(colorScheme, textTheme),
-            if (_hasActiveFilter) _buildFilterChips(colorScheme, textTheme),
-            Expanded(
-              child: _logsLoading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _buildTimeline(colorScheme, textTheme),
-            ),
+            const SizedBox(height: 4),
+            if (recentLogs.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 24),
+                child: Center(
+                  child: Text(
+                    '아직 기록이 없어요.\n첫 기록을 남겨보세요!',
+                    textAlign: TextAlign.center,
+                    style: textTheme.bodyMedium?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              )
+            else
+              for (final log in recentLogs) ...[
+                _RecentLogPreview(
+                  log: log,
+                  colorScheme: colorScheme,
+                  textTheme: textTheme,
+                  onTap: () => _openLogDetail(log),
+                ),
+                const SizedBox(height: 8),
+              ],
           ],
         ),
       ),
@@ -1196,189 +809,137 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildSearchBar(ColorScheme colorScheme, TextTheme textTheme) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-      child: Row(
-        children: [
-          Expanded(
-            child: TextField(
-              controller: _searchController,
-              autofocus: true,
-              textInputAction: TextInputAction.search,
-              decoration: InputDecoration(
-                hintText: '기록 내용 검색',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _searchQuery.isEmpty
-                    ? null
-                    : IconButton(
-                        tooltip: '검색어 지우기',
-                        icon: const Icon(Icons.clear),
-                        onPressed: () {
-                          _searchController.clear();
-                          setState(() {
-                            _searchQuery = '';
-                          });
-                        },
-                      ),
-                isDense: true,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-              ),
-              onChanged: (v) => setState(() => _searchQuery = v),
+  Widget _buildPetHeader(Pet pet, ColorScheme colorScheme, TextTheme textTheme) {
+    return InkWell(
+      onTap: _openPetPicker,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(
+          children: [
+            _PetAvatar(
+              pet: pet,
+              radius: 28,
+              uploading: _uploadingAvatar,
+              colorScheme: colorScheme,
+              textTheme: textTheme,
+              onTap: () => _changeProfileImage(pet),
+              showCameraBadge: true,
             ),
-          ),
-          const SizedBox(width: 8),
-          IconButton.filledTonal(
-            tooltip: '날짜 범위',
-            icon: const Icon(Icons.date_range),
-            onPressed: _pickDateRange,
-          ),
-        ],
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          pet.name,
+                          style: textTheme.titleLarge?.copyWith(
+                            color: pet.isRainbowBridge
+                                ? Colors.deepPurple.shade400
+                                : null,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 1,
+                        ),
+                      ),
+                      if (pet.isRainbowBridge) ...[
+                        const SizedBox(width: 4),
+                        const Text('🌈', style: TextStyle(fontSize: 18)),
+                      ],
+                      const SizedBox(width: 4),
+                      Icon(
+                        Icons.arrow_drop_down,
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                    ],
+                  ),
+                  Text(
+                    pet.isRainbowBridge
+                        ? '${pet.species} · 함께한 추억'
+                        : '${pet.species} · 함께한 지',
+                    style: textTheme.bodySmall?.copyWith(
+                      color: pet.isRainbowBridge
+                          ? Colors.deepPurple.shade300
+                          : null,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              pet.isRainbowBridge
+                  ? '추억 ${pet.daysSinceAdoption + 1}일'
+                  : 'D+${pet.daysSinceAdoption + 1}일',
+              style: textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.bold,
+                fontSize: pet.isRainbowBridge ? 16 : null,
+                color: pet.isRainbowBridge
+                    ? Colors.deepPurple.shade400
+                    : colorScheme.primary,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildFilterChips(ColorScheme colorScheme, TextTheme textTheme) {
-    final chips = <Widget>[];
-    if (_searchQuery.trim().isNotEmpty) {
-      chips.add(
-        InputChip(
-          avatar: const Icon(Icons.search, size: 18),
-          label: Text('"${_searchQuery.trim()}"'),
-          onDeleted: () {
-            _searchController.clear();
-            setState(() {
-              _searchQuery = '';
-            });
-          },
-        ),
-      );
-    }
-    final range = _dateRange;
-    if (range != null) {
-      chips.add(
-        InputChip(
-          avatar: const Icon(Icons.date_range, size: 18),
-          label: Text(_formatDateRangeLabel(range)),
-          onDeleted: () {
-            setState(() {
-              _dateRange = null;
-            });
-          },
-        ),
-      );
-    }
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-      child: Wrap(spacing: 8, runSpacing: 4, children: chips),
-    );
-  }
-
-  Widget _buildTimeline(ColorScheme colorScheme, TextTheme textTheme) {
-    final logs = _filteredLogs;
-    if (logs.isEmpty) {
-      final message = _hasActiveFilter
-          ? '검색 결과가 없어요'
-          : '아직 기록이 없어요. 첫 기록을 남겨보세요!';
-      return Center(
-        child: Text(
-          message,
-          style: textTheme.bodyMedium?.copyWith(
-            color: colorScheme.onSurfaceVariant,
+  Widget _buildActionIcons(ColorScheme colorScheme) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          IconButton(
+            tooltip: '기록 검색',
+            icon: const Icon(Icons.search),
+            color: colorScheme.primary,
+            visualDensity: VisualDensity.compact,
+            onPressed: _openSearchTab,
           ),
-        ),
-      );
-    }
-    return ListView.builder(
-      padding: const EdgeInsets.all(16),
-      itemCount: logs.length,
-      itemBuilder: (context, index) {
-        final log = logs[index];
-        return Card(
-          margin: const EdgeInsets.only(bottom: 12),
-          clipBehavior: Clip.antiAlias,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              if (log.photoUrl != null)
-                GestureDetector(
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            PhotoViewScreen(imageUrl: log.photoUrl!),
-                      ),
-                    );
-                  },
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
-                    child: Hero(
-                      tag: log.photoUrl!,
-                      child: Image.network(
-                        log.photoUrl!,
-                        height: 200,
-                        width: double.infinity,
-                        fit: BoxFit.cover,
-                      ),
-                    ),
-                  ),
-                ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 16, 4, 16),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(log.content, style: textTheme.bodyLarge),
-                          const SizedBox(height: 8),
-                          Text(
-                            _formatDate(log.createdAt),
-                            style: textTheme.bodySmall?.copyWith(
-                              color: colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    PopupMenuButton<String>(
-                      tooltip: '더보기',
-                      icon: Icon(
-                        Icons.more_vert,
-                        color: colorScheme.onSurfaceVariant,
-                      ),
-                      onSelected: (value) {
-                        switch (value) {
-                          case 'edit':
-                            _openEditLog(log);
-                            break;
-                          case 'delete':
-                            _confirmDeleteLog(log);
-                            break;
-                        }
-                      },
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(value: 'edit', child: Text('수정')),
-                        PopupMenuItem(value: 'delete', child: Text('삭제')),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ],
+          IconButton(
+            tooltip: '캘린더',
+            icon: const Icon(Icons.calendar_month_outlined),
+            color: colorScheme.primary,
+            visualDensity: VisualDensity.compact,
+            onPressed: _openCalendar,
           ),
-        );
-      },
+          IconButton(
+            tooltip: '사진 갤러리',
+            icon: const Icon(Icons.photo_library_outlined),
+            color: colorScheme.primary,
+            visualDensity: VisualDensity.compact,
+            onPressed: _openGallery,
+          ),
+          IconButton(
+            tooltip: '특별한 순간',
+            icon: const Icon(Icons.celebration_outlined),
+            color: colorScheme.primary,
+            visualDensity: VisualDensity.compact,
+            onPressed: _openMilestones,
+          ),
+          IconButton(
+            tooltip: '케어 팁',
+            icon: const Icon(Icons.tips_and_updates_outlined),
+            color: colorScheme.primary,
+            visualDensity: VisualDensity.compact,
+            onPressed: _openCareTips,
+          ),
+          IconButton(
+            tooltip: '할 일',
+            icon: const Icon(Icons.checklist_rounded),
+            color: colorScheme.primary,
+            visualDensity: VisualDensity.compact,
+            onPressed: _openTodos,
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1393,6 +954,17 @@ class _Anniversary {
     required this.upcomingLabel,
     required this.todayLabel,
     required this.date,
+    required this.daysUntil,
+  });
+}
+
+class _VaccinationAlert {
+  final String name;
+  final DateTime dueDate;
+  final int daysUntil;
+  const _VaccinationAlert({
+    required this.name,
+    required this.dueDate,
     required this.daysUntil,
   });
 }
@@ -1415,48 +987,53 @@ class _AnniversaryCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isToday = anniversary.daysUntil == 0;
-    final message = isToday
-        ? '오늘은 $petName ${anniversary.todayLabel}! 🎉'
-        : '🎉 ${anniversary.upcomingLabel}까지 D-${anniversary.daysUntil}';
-
+    final label =
+        isToday ? anniversary.todayLabel : '${anniversary.upcomingLabel}';
+    final sub = isToday
+        ? '$petName와 함께한 특별한 날이에요'
+        : 'D-${anniversary.daysUntil} (${anniversary.date.month}/${anniversary.date.day})';
     return Material(
-      color: colorScheme.tertiaryContainer,
+      color: colorScheme.secondaryContainer,
       borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
       child: InkWell(
+        borderRadius: BorderRadius.circular(12),
         onTap: onTap,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           child: Row(
             children: [
-              Icon(
-                Icons.celebration_outlined,
-                color: colorScheme.onTertiaryContainer,
-              ),
-              const SizedBox(width: 12),
+              const Text('🎉', style: TextStyle(fontSize: 22)),
+              const SizedBox(width: 10),
               Expanded(
-                child: Text(
-                  message,
-                  style: textTheme.bodyMedium?.copyWith(
-                    color: colorScheme.onTertiaryContainer,
-                    fontWeight: FontWeight.w600,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      style: textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        color: colorScheme.onSecondaryContainer,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      sub,
+                      style: textTheme.bodySmall?.copyWith(
+                        color: colorScheme.onSecondaryContainer
+                            .withValues(alpha: 0.85),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              Icon(Icons.chevron_right, color: colorScheme.onTertiaryContainer),
+              Icon(Icons.chevron_right,
+                  color: colorScheme.onSecondaryContainer),
             ],
           ),
         ),
       ),
     );
   }
-}
-
-class _VaccinationAlert {
-  final Vaccination vaccination;
-  final int daysUntil;
-
-  const _VaccinationAlert(this.vaccination, this.daysUntil);
 }
 
 class _VaccinationBanner extends StatelessWidget {
@@ -1474,136 +1051,57 @@ class _VaccinationBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bg = colorScheme.primaryContainer;
-    final fg = colorScheme.onPrimaryContainer;
-
-    final String message;
-    if (alert.daysUntil == 0) {
-      message = '${alert.vaccination.name} 예정일이 오늘이에요';
-    } else {
-      message = '${alert.vaccination.name} 예정일이 ${alert.daysUntil}일 남았어요';
-    }
-
+    final overdue = alert.daysUntil < 0;
+    final isToday = alert.daysUntil == 0;
+    final label = overdue
+        ? '${alert.name} 접종이 ${alert.daysUntil.abs()}일 지났어요'
+        : isToday
+            ? '오늘 ${alert.name} 접종일이에요'
+            : '${alert.name} 접종 D-${alert.daysUntil}';
+    final color = overdue
+        ? colorScheme.errorContainer
+        : colorScheme.primaryContainer;
+    final onColor = overdue
+        ? colorScheme.onErrorContainer
+        : colorScheme.onPrimaryContainer;
     return Material(
-      color: bg,
+      color: color,
       borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
       child: InkWell(
+        borderRadius: BorderRadius.circular(12),
         onTap: onTap,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           child: Row(
             children: [
-              Icon(Icons.vaccines_outlined, color: fg),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  message,
-                  style: textTheme.bodyMedium?.copyWith(
-                    color: fg,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              Icon(Icons.chevron_right, color: fg),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _NearbyVetButton extends StatelessWidget {
-  final ColorScheme colorScheme;
-  final TextTheme textTheme;
-  final VoidCallback onTap;
-
-  const _NearbyVetButton({
-    required this.colorScheme,
-    required this.textTheme,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final bg = colorScheme.secondaryContainer;
-    final fg = colorScheme.onSecondaryContainer;
-
-    return Material(
-      color: bg,
-      borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-          child: Row(
-            children: [
-              Icon(Icons.local_hospital_outlined, color: fg),
-              const SizedBox(width: 12),
+              Text(overdue ? '⚠️' : '💉',
+                  style: const TextStyle(fontSize: 20)),
+              const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '내 주변 동물병원 찾기',
-                      style: textTheme.bodyMedium?.copyWith(
-                        color: fg,
-                        fontWeight: FontWeight.w700,
+                      label,
+                      style: textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        color: onColor,
                       ),
                     ),
+                    const SizedBox(height: 2),
                     Text(
-                      '지도 앱으로 바로 연결돼요',
+                      '${alert.dueDate.year}.${alert.dueDate.month.toString().padLeft(2, '0')}.${alert.dueDate.day.toString().padLeft(2, '0')} 예정',
                       style: textTheme.bodySmall?.copyWith(
-                        color: fg.withValues(alpha: 0.8),
+                        color: onColor.withValues(alpha: 0.85),
                       ),
                     ),
                   ],
                 ),
               ),
-              Icon(Icons.chevron_right, color: fg),
+              Icon(Icons.chevron_right, color: onColor),
             ],
           ),
         ),
-      ),
-    );
-  }
-}
-
-class _StatChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final ColorScheme colorScheme;
-  final TextTheme textTheme;
-
-  const _StatChip({
-    required this.icon,
-    required this.label,
-    required this.colorScheme,
-    required this.textTheme,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 16, color: colorScheme.onSurfaceVariant),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: textTheme.labelLarge?.copyWith(
-              color: colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -1624,55 +1122,162 @@ class _GuestAccountBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bg = colorScheme.surfaceContainerHighest;
-    final fg = colorScheme.onSurface;
-
     return Material(
-      color: bg,
+      color: colorScheme.tertiaryContainer,
       borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 10, 6, 10),
+        padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
         child: Row(
           children: [
-            Icon(Icons.shield_moon_outlined, color: colorScheme.primary),
-            const SizedBox(width: 12),
+            Icon(Icons.cloud_outlined,
+                color: colorScheme.onTertiaryContainer),
+            const SizedBox(width: 10),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    '계정을 만들면 기기를 바꿔도\n데이터가 안전하게 보관돼요',
+                    '계정을 만들면 기기 간에 데이터가 동기화돼요',
                     style: textTheme.bodyMedium?.copyWith(
-                      color: fg,
-                      fontWeight: FontWeight.w600,
-                      height: 1.3,
+                      fontWeight: FontWeight.w700,
+                      color: colorScheme.onTertiaryContainer,
                     ),
                   ),
                   const SizedBox(height: 6),
-                  FilledButton.tonal(
-                    onPressed: onCreateAccount,
-                    style: FilledButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 4,
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      FilledButton(
+                        onPressed: onCreateAccount,
+                        child: const Text('계정 만들기'),
                       ),
-                    ),
-                    child: const Text('계정 만들기'),
+                      TextButton(
+                        onPressed: onDismiss,
+                        child: const Text('나중에'),
+                      ),
+                    ],
                   ),
                 ],
               ),
             ),
-            IconButton(
-              tooltip: '닫기',
-              icon: const Icon(Icons.close),
-              color: colorScheme.onSurfaceVariant,
-              onPressed: onDismiss,
-            ),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _TodayTodoBanner extends StatelessWidget {
+  final int count;
+  final ColorScheme colorScheme;
+  final TextTheme textTheme;
+  final VoidCallback onTap;
+
+  const _TodayTodoBanner({
+    required this.count,
+    required this.colorScheme,
+    required this.textTheme,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: colorScheme.tertiaryContainer,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Row(
+            children: [
+              const Text('📋', style: TextStyle(fontSize: 20)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '오늘 할 일 $count개',
+                      style: textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        color: colorScheme.onTertiaryContainer,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '체크하지 않은 할 일이 있어요. 탭해서 확인해보세요.',
+                      style: textTheme.bodySmall?.copyWith(
+                        color: colorScheme.onTertiaryContainer
+                            .withValues(alpha: 0.85),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                Icons.chevron_right,
+                color: colorScheme.onTertiaryContainer,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TodoAppBarAction extends StatelessWidget {
+  final int count;
+  final ColorScheme colorScheme;
+  final VoidCallback onTap;
+
+  const _TodoAppBarAction({
+    required this.count,
+    required this.colorScheme,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        IconButton(
+          tooltip: '할 일',
+          icon: const Icon(Icons.checklist_rounded),
+          color: colorScheme.primary,
+          onPressed: onTap,
+        ),
+        if (count > 0)
+          Positioned(
+            right: 6,
+            top: 6,
+            child: IgnorePointer(
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 5,
+                  vertical: 1,
+                ),
+                constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+                decoration: BoxDecoration(
+                  color: colorScheme.error,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  count > 99 ? '99+' : '$count',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
@@ -1696,23 +1301,54 @@ class _PetPickerTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
+    final purple = Colors.deepPurple.shade400;
+
+    final leading = _PetAvatar(
+      pet: pet,
+      radius: 20,
+      uploading: false,
+      colorScheme: colorScheme,
+      textTheme: textTheme,
+      onTap: null,
+      showCameraBadge: false,
+    );
+
+    final title = pet.isRainbowBridge
+        ? Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Flexible(
+                child: Text(
+                  pet.name,
+                  style: TextStyle(color: purple, fontWeight: FontWeight.w700),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 4),
+              const Text('🌈', style: TextStyle(fontSize: 14)),
+            ],
+          )
+        : Text(pet.name);
+
+    final subtitle = pet.isRainbowBridge
+        ? Text(
+            '${pet.species} · 추모 중',
+            style: TextStyle(color: purple.withValues(alpha: 0.8)),
+          )
+        : Text(pet.species);
 
     return ListTile(
-      leading: CircleAvatar(
-        backgroundColor: colorScheme.primaryContainer,
-        child: Text(
-          pet.name.characters.first,
-          style: textTheme.titleMedium?.copyWith(
-            color: colorScheme.onPrimaryContainer,
-          ),
-        ),
-      ),
-      title: Text(pet.name),
-      subtitle: Text(pet.species),
+      leading: leading,
+      title: title,
+      subtitle: subtitle,
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (selected) Icon(Icons.check, color: colorScheme.primary),
+          if (selected)
+            Icon(
+              Icons.check,
+              color: pet.isRainbowBridge ? purple : colorScheme.primary,
+            ),
           IconButton(
             tooltip: '가족 공유',
             icon: const Icon(Icons.group_add_outlined),
@@ -1726,6 +1362,275 @@ class _PetPickerTile extends StatelessWidget {
         ],
       ),
       onTap: onTap,
+    );
+  }
+}
+
+class _RecentLogPreview extends StatelessWidget {
+  final LogEntry log;
+  final ColorScheme colorScheme;
+  final TextTheme textTheme;
+  final VoidCallback onTap;
+
+  const _RecentLogPreview({
+    required this.log,
+    required this.colorScheme,
+    required this.textTheme,
+    required this.onTap,
+  });
+
+  String _shortDate(DateTime t) {
+    final y = t.year.toString().padLeft(4, '0');
+    final m = t.month.toString().padLeft(2, '0');
+    final d = t.day.toString().padLeft(2, '0');
+    return '$y.$m.$d';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final media = log.displayMedia;
+    final hasMedia = media.isNotEmpty;
+    return Material(
+      color: colorScheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(12),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (hasMedia)
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: SizedBox(
+                    width: 70,
+                    height: 70,
+                    child: _PreviewThumb(
+                      media: media.first,
+                      colorScheme: colorScheme,
+                    ),
+                  ),
+                )
+              else
+                Container(
+                  width: 70,
+                  height: 70,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: colorScheme.surface,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Icon(
+                    Icons.edit_note_outlined,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      log.content,
+                      style: textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Text(
+                          _shortDate(log.createdAt),
+                          style: textTheme.bodySmall?.copyWith(
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        if (log.likeCount > 0) ...[
+                          const SizedBox(width: 10),
+                          Icon(Icons.favorite,
+                              size: 12, color: Colors.red.shade400),
+                          const SizedBox(width: 3),
+                          Text(
+                            '${log.likeCount}',
+                            style: textTheme.bodySmall?.copyWith(
+                              color: Colors.red.shade400,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PreviewThumb extends StatelessWidget {
+  final LogMedia media;
+  final ColorScheme colorScheme;
+
+  const _PreviewThumb({required this.media, required this.colorScheme});
+
+  @override
+  Widget build(BuildContext context) {
+    if (media.isVideo) {
+      return Container(
+        color: Colors.black87,
+        alignment: Alignment.center,
+        child: const Icon(
+          Icons.play_circle_fill,
+          color: Colors.white70,
+          size: 24,
+        ),
+      );
+    }
+    return Image.network(
+      media.mediaUrl,
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => Container(
+        color: colorScheme.surface,
+        alignment: Alignment.center,
+        child: Icon(
+          Icons.broken_image_outlined,
+          color: colorScheme.onSurfaceVariant,
+        ),
+      ),
+    );
+  }
+}
+
+class _PetAvatar extends StatelessWidget {
+  final Pet pet;
+  final double radius;
+  final bool uploading;
+  final ColorScheme colorScheme;
+  final TextTheme textTheme;
+  // null이면 비활성 (자체 탭 없음). 그렇지 않으면 탭 시 콜백 호출.
+  final VoidCallback? onTap;
+  final bool showCameraBadge;
+
+  const _PetAvatar({
+    required this.pet,
+    required this.radius,
+    required this.uploading,
+    required this.colorScheme,
+    required this.textTheme,
+    required this.onTap,
+    required this.showCameraBadge,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final size = radius * 2;
+    final purple = Colors.deepPurple.shade400;
+    final initial = pet.name.isEmpty ? '🐾' : pet.name.characters.first;
+    final url = pet.profileImageUrl;
+
+    Widget avatarContent = ClipOval(
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: url != null
+            ? Image.network(
+                url,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => _fallback(initial, purple),
+              )
+            : _fallback(initial, purple),
+      ),
+    );
+
+    if (pet.isRainbowBridge) {
+      avatarContent = ColorFiltered(
+        colorFilter: const ColorFilter.matrix(<double>[
+          0.33, 0.59, 0.11, 0, 0,
+          0.33, 0.59, 0.11, 0, 0,
+          0.33, 0.59, 0.11, 0, 0,
+          0,    0,    0,    1, 0,
+        ]),
+        child: avatarContent,
+      );
+    }
+
+    final stack = Stack(
+      clipBehavior: Clip.none,
+      children: [
+        avatarContent,
+        if (uploading)
+          Positioned.fill(
+            child: Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Colors.black.withValues(alpha: 0.35),
+              ),
+              alignment: Alignment.center,
+              child: SizedBox(
+                width: radius * 0.7,
+                height: radius * 0.7,
+                child: const CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: Colors.white,
+                ),
+              ),
+            ),
+          ),
+        if (showCameraBadge && !uploading)
+          Positioned(
+            right: -2,
+            bottom: -2,
+            child: IgnorePointer(
+              child: Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(
+                  color: colorScheme.primary,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: colorScheme.surface, width: 1.5),
+                ),
+                child: Icon(
+                  Icons.photo_camera_outlined,
+                  size: radius * 0.45,
+                  color: colorScheme.onPrimary,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+
+    if (onTap == null) return stack;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: stack,
+    );
+  }
+
+  Widget _fallback(String initial, Color purple) {
+    final bg = pet.isRainbowBridge
+        ? Colors.deepPurple.withValues(alpha: 0.22)
+        : colorScheme.primaryContainer;
+    final fg = pet.isRainbowBridge ? purple : colorScheme.onPrimaryContainer;
+    return Container(
+      color: bg,
+      alignment: Alignment.center,
+      child: Text(
+        initial,
+        style: TextStyle(
+          fontSize: radius * 0.9,
+          fontWeight: FontWeight.w700,
+          color: fg,
+        ),
+      ),
     );
   }
 }

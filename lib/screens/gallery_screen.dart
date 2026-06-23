@@ -1,8 +1,15 @@
 import 'package:flutter/material.dart';
 
 import '../models/log_entry.dart';
+import '../models/log_media.dart';
 import '../services/supabase_service.dart';
-import 'photo_view_screen.dart';
+import 'media_viewer_screen.dart';
+
+class _GalleryItem {
+  final LogEntry log;
+  final LogMedia media;
+  const _GalleryItem({required this.log, required this.media});
+}
 
 class GalleryScreen extends StatefulWidget {
   final String petId;
@@ -16,7 +23,7 @@ class GalleryScreen extends StatefulWidget {
 class _GalleryScreenState extends State<GalleryScreen> {
   final SupabaseService _service = SupabaseService();
 
-  List<LogEntry> _photos = [];
+  List<_GalleryItem> _items = [];
   bool _loading = true;
   String? _error;
 
@@ -34,8 +41,14 @@ class _GalleryScreenState extends State<GalleryScreen> {
     try {
       final logs = await _service.fetchLogs(widget.petId);
       if (!mounted) return;
+      final items = <_GalleryItem>[];
+      for (final l in logs) {
+        for (final m in l.displayMedia) {
+          items.add(_GalleryItem(log: l, media: m));
+        }
+      }
       setState(() {
-        _photos = logs.where((l) => l.photoUrl != null).toList();
+        _items = items;
         _loading = false;
       });
     } catch (e) {
@@ -47,10 +60,16 @@ class _GalleryScreenState extends State<GalleryScreen> {
     }
   }
 
-  void _openPhoto(String url) {
+  void _open(int index) {
+    final allMedia = [for (final it in _items) it.media];
     Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => PhotoViewScreen(imageUrl: url)),
+      MaterialPageRoute(
+        builder: (_) => MediaViewerScreen(
+          media: allMedia,
+          initialIndex: index,
+        ),
+      ),
     );
   }
 
@@ -92,12 +111,12 @@ class _GalleryScreenState extends State<GalleryScreen> {
       );
     }
 
-    if (_photos.isEmpty) {
+    if (_items.isEmpty) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Text(
-            '아직 사진이 없어요.\n기록에 사진을 추가하면 여기 모아져요.',
+            '아직 미디어가 없어요.\n기록에 사진이나 동영상을 추가하면 여기 모아져요.',
             style: textTheme.bodyMedium?.copyWith(
               color: colorScheme.onSurfaceVariant,
             ),
@@ -114,30 +133,70 @@ class _GalleryScreenState extends State<GalleryScreen> {
         mainAxisSpacing: 6,
         crossAxisSpacing: 6,
       ),
-      itemCount: _photos.length,
+      itemCount: _items.length,
       itemBuilder: (context, index) {
-        final url = _photos[index].photoUrl!;
+        final m = _items[index].media;
         return GestureDetector(
-          onTap: () => _openPhoto(url),
+          onTap: () => _open(index),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(10),
-            child: Hero(
-              tag: url,
-              child: Image.network(
-                url,
-                fit: BoxFit.cover,
-                errorBuilder: (_, _, _) => Container(
-                  color: colorScheme.surfaceContainerHighest,
-                  child: Icon(
-                    Icons.broken_image_outlined,
-                    color: colorScheme.onSurfaceVariant,
-                  ),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Hero(
+                  tag: m.mediaUrl,
+                  child: _GalleryThumb(media: m, colorScheme: colorScheme),
                 ),
-              ),
+                if (m.isVideo)
+                  const IgnorePointer(
+                    child: Center(
+                      child: Icon(
+                        Icons.play_circle_fill,
+                        color: Colors.white,
+                        size: 36,
+                        shadows: [
+                          Shadow(color: Colors.black54, blurRadius: 6),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
         );
       },
+    );
+  }
+}
+
+class _GalleryThumb extends StatelessWidget {
+  final LogMedia media;
+  final ColorScheme colorScheme;
+  const _GalleryThumb({required this.media, required this.colorScheme});
+
+  @override
+  Widget build(BuildContext context) {
+    if (media.isVideo) {
+      return Container(
+        color: Colors.black87,
+        alignment: Alignment.center,
+        child: const Icon(
+          Icons.movie_outlined,
+          color: Colors.white54,
+          size: 36,
+        ),
+      );
+    }
+    return Image.network(
+      media.mediaUrl,
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => Container(
+        color: colorScheme.surfaceContainerHighest,
+        child: Icon(
+          Icons.broken_image_outlined,
+          color: colorScheme.onSurfaceVariant,
+        ),
+      ),
     );
   }
 }

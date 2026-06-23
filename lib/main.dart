@@ -7,7 +7,7 @@ import 'package:intl/date_symbol_data_local.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-import 'screens/home_screen.dart';
+import 'screens/main_screen.dart';
 import 'screens/onboarding_screen.dart';
 import 'services/notification_service.dart';
 import 'supabase_config.dart';
@@ -113,7 +113,7 @@ class _PetDiaryAppState extends State<PetDiaryApp> {
         final navigator = _navigatorKey.currentState;
         if (navigator == null) return;
         navigator.pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const HomeScreen()),
+          MaterialPageRoute(builder: (_) => const MainScreen()),
           (route) => false,
         );
       }
@@ -157,7 +157,7 @@ class _PetDiaryAppState extends State<PetDiaryApp> {
                   ? OnboardingScreen(
                       onFinish: () => setState(() => _showOnboarding = false),
                     )
-                  : const HomeScreen(),
+                  : const MainScreen(),
             );
           },
         );

@@ -1,7 +1,7 @@
-// 대략적 기준: 강아지/고양이 라이프스테이지는 품종·크기에 따라 차이가 큽니다.
-// - 강아지: <1세 baby / 1~7세 adult / 7세+ senior
-// - 고양이: <1세 baby / 1~10세 adult / 10세+ senior
-// - 기타: <1세 baby / 1~7세 adult / 7세+ senior (대략값)
+// 라이프스테이지 기준 (Pet.seniorThresholdYears와 동일):
+// - 강아지: 0~1세 baby / 1~8세 adult / 8세+ senior
+// - 고양이: 0~1세 baby / 1~10세 adult / 10세+ senior
+// - 기타: 0~1세 baby / 1~5세 adult / 5세+ senior
 String lifeStageFor({required String speciesKey, required DateTime? birthday}) {
   if (birthday == null) return 'adult';
   final now = DateTime.now();
@@ -11,13 +11,19 @@ String lifeStageFor({required String speciesKey, required DateTime? birthday}) {
       (now.month == birthday.month && now.day >= birthday.day);
   if (!hadBirthdayThisYear) years -= 1;
   if (years < 1) return 'baby';
+  final threshold = seniorThresholdYearsForKey(speciesKey);
+  return years >= threshold ? 'senior' : 'adult';
+}
+
+int seniorThresholdYearsForKey(String speciesKey) {
   switch (speciesKey) {
-    case 'cat':
-      return years >= 10 ? 'senior' : 'adult';
     case 'dog':
+      return 8;
+    case 'cat':
+      return 10;
     case 'other':
     default:
-      return years >= 7 ? 'senior' : 'adult';
+      return 5;
   }
 }
 
