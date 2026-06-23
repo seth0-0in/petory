@@ -19,50 +19,71 @@
 
 ## 📱 스크린샷
 
-| 홈 화면 | 캘린더 | 건강 기록 | 케어 팁 |
-|--------|--------|----------|--------|
-| <img src="https://github.com/seth0-0in/petory/raw/main/screenshots/홈화면.png" width="180"/> | <img src="https://github.com/seth0-0in/petory/raw/main/screenshots/캘린더.png" width="180"/> | <img src="https://github.com/seth0-0in/petory/raw/main/screenshots/체중그래프.png" width="180"/> | <img src="https://github.com/seth0-0in/petory/raw/main/screenshots/케어팁.png" width="180"/> |
+| 홈 | 일기 | 일기 상세 |
+|---|---|---|
+| <img src="screenshots/home.png" width="200"/> | <img src="screenshots/diary.png" width="200"/> | <img src="screenshots/diary_detail.png" width="200"/> |
+
+| 건강 | 케어 | 설정 |
+|---|---|---|
+| <img src="screenshots/health.png" width="200"/> | <img src="screenshots/care.png" width="200"/> | <img src="screenshots/settings.png" width="200"/> |
+
+| 할 일 | 매일 건강체크 | 증상 체크 |
+|---|---|---|
+| <img src="screenshots/todo.png" width="200"/> | <img src="screenshots/daily_check.png" width="200"/> | <img src="screenshots/symptom_check.png" width="200"/> |
 
 ---
 
 ## ✨ 주요 기능
 
-### 📖 사진 일기
-- 매일의 소중한 순간을 사진과 함께 기록
-- 타임라인으로 추억을 한눈에
-- 날짜·키워드 검색 및 날짜 범위 필터
+### 🏠 홈
+- 펫 프로필 사진 + D+일수
+- 오늘 할 일 · 기념일 배너
+- 최근 일기 미리보기
+- 여러 반려동물 전환
+
+### 📖 일기
+- 사진 여러 장 + 동영상 업로드
+- 타임라인 뷰 + 날짜/키워드 검색
+- 하트(좋아요) + 가족 댓글
+- 사진 갤러리 뷰
 
 ### ❤️ 건강 관리
-- **체중** — 그래프로 변화 추이 확인
-- **예방접종** — 일정 관리 및 기기 알림
-- **투약/영양제** — 복용 스케줄 + 시간 알림
-- **병원 기록** — 증상·진단·비용 기록
+- **체중** — 그래프로 변화 추이
+- **예방접종** — 일정 관리 + 알림
+- **투약/영양제** — 스케줄 + 시간 알림
+- **병원 기록** — 증상·진단·비용
+- **배변 기록** — 형태·색깔 기록 + 이상 감지
+- **음수 기록** — 일일 음수량 + 목표 달성률
+- **미용 기록** — 시술 항목 + 다음 예정일 알림 + 미용실 찾기
+- **발정기 관리** — 주기 기록 + 다음 예상일 알림
+- **매일 건강체크** — 식욕·활동량·수면·배변·통증 (노령 펫)
+- **건강 트렌드** — 30일 추이 차트 (노령 펫)
 
-### 🌿 케어 팁
-- 수의학 가이드라인(AAHA/AAFP) 기반 정보
-- 나이·종·품종별 맞춤 케어 정보 제공
+### 🌿 케어
+- **나이·종별 케어 팁** — AAHA/AAFP 가이드라인 기반
+- **증상 체크리스트** — 관절·인지·심장·소화·피부 (노령 펫)
+- **위급상황 대처 가이드** — 응급 상황별 대처법
+- **무지개다리 정보** — 펫로스 안내 · 장례 절차
+- **내 주변 동물병원 찾기** — 네이버/카카오/구글 지도 연동
+- **반려동물 동반 장소 찾기** — 카페·식당·숙소·공원
+- **소동물 케이지 관리** — 청소·먹이·물 교체 기록 + 알림
 
-### 📅 캘린더
-- 기록·접종·기념일을 달력으로 한눈에
-- 이벤트 탭 시 관련 화면으로 이동
-
-### 🎉 기념일 & 마일스톤
-- 입양 D+100/200/... 자동 계산
-- 입양 기념일·생일 알림
+### ✅ 할 일
+- 반려동물별 할 일 등록
+- 매일/매주/매월 반복 설정
+- 알림 + 완료 체크
 
 ### 👨‍👩‍👧 가족 공유
 - 초대 코드로 가족과 함께 기록
+- 일기에 댓글 + 하트
 - 실시간 데이터 동기화
 
-### 🏥 내 주변 동물병원 찾기
-- 네이버 지도·카카오맵·구글 지도 연동
-
-### ⚙️ 기타
-- 테마 색상 변경 (6가지)
-- 다크 모드 지원
+### ⚙️ 설정
+- 테마 색상 6가지
+- 다크 모드
 - 데이터 내보내기 (CSV/JSON)
-- 게스트로 바로 시작 (회원가입 불필요)
-- 계정 생성으로 기기 변경 시 데이터 보존
+- 계정 생성 + 기기 변경 시 데이터 보존
+- 게스트로 바로 시작 가능
 
 ---
 
@@ -72,12 +93,12 @@
 |------|------|
 | **Frontend** | Flutter 3.44.1, Dart |
 | **Backend** | Supabase (PostgreSQL, Auth, Storage) |
-| **상태 관리** | ValueNotifier |
+| **상태 관리** | ValueNotifier, PetSession 싱글톤 |
 | **차트** | fl_chart |
-| **지도** | url_launcher (딥링크) |
 | **알림** | flutter_local_notifications |
+| **지도** | url_launcher (딥링크) |
+| **미디어** | image_picker, video_player |
 | **인증** | Supabase Auth (익명 + 이메일) |
-| **스토리지** | Supabase Storage |
 
 ---
 
@@ -88,8 +109,8 @@
 - Android Studio (에뮬레이터용)
 - Supabase 프로젝트
 
-### 환경 변수 설정
-`lib/supabase_config.dart` 파일에 Supabase 프로젝트 URL과 키를 설정하세요.
+### 환경 설정
+`lib/supabase_config.dart` 에 Supabase 프로젝트 URL과 키를 설정하세요.
 
 ```dart
 const supabaseUrl = 'YOUR_SUPABASE_URL';
@@ -119,14 +140,25 @@ flutter build apk --release
 ```
 auth.users
 ├── pets (반려동물)
-│   ├── pet_members (멤버십/가족 공유)
+│   ├── pet_members (가족 공유)
+│   ├── pet_invites (초대 코드)
 │   ├── logs (사진 일기)
+│   │   ├── log_media (다중 미디어)
+│   │   ├── log_comments (댓글)
+│   │   └── log_likes (하트)
 │   ├── weight_records (체중)
 │   ├── vaccinations (예방접종)
 │   ├── medications (투약)
 │   ├── vet_visits (병원 기록)
 │   ├── milestones (마일스톤)
-│   └── pet_invites (초대 코드)
+│   ├── grooming_records (미용)
+│   ├── heat_cycles (발정기)
+│   ├── daily_health_logs (매일 건강체크)
+│   ├── poop_logs (배변)
+│   ├── water_logs (음수)
+│   ├── cage_logs (케이지 관리)
+│   ├── cage_schedules (케이지 스케줄)
+│   └── todo_items (할 일)
 ├── feedback (피드백)
 └── care_tips (케어 팁, 공개)
 ```
@@ -137,18 +169,22 @@ auth.users
 
 ```
 lib/
-├── main.dart                 # 앱 진입점
-├── supabase_config.dart      # Supabase 설정
-├── models/                   # 데이터 모델
-├── services/                 # 비즈니스 로직
+├── main.dart
+├── supabase_config.dart
+├── models/
+├── services/
 │   ├── auth_service.dart
 │   ├── supabase_service.dart
-│   └── notification_service.dart
-└── screens/                  # UI 화면
-    ├── home_screen.dart
-    ├── health_screen.dart
-    ├── calendar_screen.dart
-    ├── care_tips_screen.dart
+│   ├── notification_service.dart
+│   ├── reminder_scheduler.dart
+│   └── pet_session.dart
+└── screens/
+    ├── main_screen.dart       # 하단 네비게이션
+    ├── home_screen.dart       # 홈 탭
+    ├── diary_screen.dart      # 일기 탭
+    ├── health_tab.dart        # 건강 탭
+    ├── care_screen.dart       # 케어 탭
+    ├── settings_screen.dart   # 설정 탭
     └── ...
 ```
 
@@ -169,4 +205,4 @@ lib/
 
 ## 📄 라이선스
 
-MIT License © 2026 TrueWorld Studio 
+MIT License © 2026 TrueWorld Studio
